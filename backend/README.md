@@ -107,3 +107,4 @@ pip list | grep openai
 conda activate p312
 pip install -r requirements.txt
 ```
+# IngrediScanAI
