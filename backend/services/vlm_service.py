@@ -107,6 +107,9 @@ class VLMService:
     
     def _image_to_base64(self, image: Image.Image) -> str:
         """将 PIL Image 转换为 Base64 字符串"""
+        # 确保图片为 RGB 模式（JPEG 不支持 RGBA）
+        if image.mode != "RGB":
+            image = image.convert("RGB")
         buffered = io.BytesIO()
         image.save(buffered, format="JPEG", quality=85)
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
