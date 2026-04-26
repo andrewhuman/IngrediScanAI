@@ -1,4 +1,5 @@
 import withPWA from 'next-pwa'
+import { withSentryConfig } from '@sentry/nextjs'
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -32,4 +33,15 @@ const pwaConfig = withPWA({
   ],
 })
 
-export default pwaConfig(nextConfig)
+const nextConfigWithPwa = pwaConfig(nextConfig)
+
+const sentryWebpackPluginOptions = {
+  org: process.env.SENTRY_ORG,
+  project: process.env.SENTRY_PROJECT,
+  authToken: process.env.SENTRY_AUTH_TOKEN,
+  silent: true,
+}
+
+export default withSentryConfig(nextConfigWithPwa, sentryWebpackPluginOptions, {
+  disableLogger: true,
+})

@@ -74,6 +74,13 @@ function getBackendBaseUrl(): string {
   throw new Error("未配置 NEXT_PUBLIC_BACKEND_URL，请先设置后端服务地址")
 }
 
+function createRequestId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID()
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
 /**
  * 上传图片并获取分析结果
  */
@@ -82,15 +89,37 @@ export async function analyzeImage(
   imageType: string
 ): Promise<AnalyzeResponse> {
   const backendBaseUrl = getBackendBaseUrl()
-  const response = await fetch(`${backendBaseUrl}/api/v1/analyze`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      image_base64: imageBase64,
-      image_type: imageType,
-    } as BackendAnalyzeRequest),
+  const requestId = createRequestId()
+  let response: Response
+  try {
+    console.info("[analyze] request_start", {
+      requestId,
+      backendBaseUrl,
+      imageType,
+      imageBase64Length: imageBase64.length,
+    })
+    response = await fetch(`${backendBaseUrl}/api/v1/analyze`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Request-ID': requestId,
+      },
+      body: JSON.stringify({
+        image_base64: imageBase64,
+        image_type: imageType,
+      } as BackendAnalyzeRequest),
+    })
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    console.error("[analyze] request_network_failed", { requestId, reason })
+    throw new Error(`网络请求失败（可能是 CORS 或后端不可达，requestId=${requestId}）: ${reason}`)
+  }
+
+  const responseRequestId = response.headers.get("x-request-id") || requestId
+  console.info("[analyze] request_done", {
+    requestId: responseRequestId,
+    status: response.status,
+    ok: response.ok,
   })
 
   if (!response.ok) {
@@ -100,8 +129,16 @@ export async function analyzeImage(
       error.detail ||
       error.message ||
       `HTTP ${response.status}: ${response.statusText}`
-    throw new Error(message)
+    throw new Error(`${message} (requestId=${responseRequestId})`)
   }
 
-  return response.json()
+  const result = await response.json()
+  if (result?.error) {
+    console.warn("[analyze] backend_returned_error", {
+      requestId: responseRequestId,
+      errorType: result.error_type,
+      error: result.error,
+    })
+  }
+  return result
 }

@@ -72,3 +72,5 @@ build/
 *.swo
 *~
 OPENCLAW_DEPLOYMENT.md
+
+*.txt

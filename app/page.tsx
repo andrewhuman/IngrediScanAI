@@ -21,7 +21,13 @@ import { Progress } from "@/components/ui/progress"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Checkbox } from "@/components/ui/checkbox"
 import { cn } from "@/lib/utils"
-import { compressImage, blobToBase64, createImagePreview, revokeImagePreview } from "@/lib/image-compression"
+import {
+  blobToBase64,
+  compressImage,
+  createImagePreview,
+  createThumbnailDataUrl,
+  revokeImagePreview,
+} from "@/lib/image-compression"
 import { analyzeImage, type AnalyzeResponse } from "@/lib/api"
 
 type Page = "scan" | "compressing" | "uploading" | "processing" | "results" | "history" | "settings"
@@ -41,9 +47,12 @@ interface ScanHistory {
   grade: string
   score: number
   thumbnail: string
-  imageBase64?: string  // 保存图片的 base64 数据，用于重新显示
-  analysisData: AnalyzeResponse  // 完整的分析结果
+  analysisData: AnalyzeResponse
 }
+
+const HISTORY_STORAGE_KEY = "scanHistory"
+const HISTORY_LIMIT = 20
+const PLACEHOLDER_IMAGE = "/placeholder.svg"
 
 const COMMON_ALLERGENS = [
   "Peanuts",
@@ -75,51 +84,69 @@ export default function IngrediScanAI() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const cameraInputRef = useRef<HTMLInputElement>(null)
 
-  // 从 localStorage 加载历史记录
+  // 历史记录只保存在当前浏览器本地；后端不保存图片或分析结果。
   useEffect(() => {
-    const savedHistory = localStorage.getItem('scanHistory')
+    const savedHistory = localStorage.getItem(HISTORY_STORAGE_KEY)
     if (savedHistory) {
       try {
         const parsed = JSON.parse(savedHistory)
-        const loaded = parsed.map((item: any) => ({
-          ...item,
-          date: new Date(item.date),
-          // 确保 analysisData 存在
-          analysisData: item.analysisData || {
-            health_score: item.grade || "",
-            summary: item.productName || "",
-            risks: [],
-            full_ingredients: [],
-            alternatives: [],
-          },
-        }))
+        const loaded = parsed.slice(0, HISTORY_LIMIT).map((item: any) => {
+          const thumbnail =
+            typeof item.thumbnail === "string" && item.thumbnail.startsWith("data:")
+              ? item.thumbnail
+              : PLACEHOLDER_IMAGE
+
+          return {
+            id: String(item.id || Date.now()),
+            date: new Date(item.date),
+            productName: item.productName || item.summary || "Unknown Product",
+            grade: item.grade || item.analysisData?.health_score || "",
+            score: Number(item.score || parseScoreFromSummary(item.summary || item.analysisData?.summary || "")),
+            thumbnail,
+            analysisData: item.analysisData || {
+              health_score: item.grade || "",
+              summary: item.productName || "",
+              risks: [],
+              full_ingredients: [],
+              alternatives: [],
+            },
+          }
+        })
         setScanHistory(loaded)
+        localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(loaded))
       } catch (e) {
         console.error('加载历史记录失败:', e)
-        // 如果解析失败，清空损坏的数据
-        localStorage.removeItem('scanHistory')
+        localStorage.removeItem(HISTORY_STORAGE_KEY)
       }
     }
   }, [])
 
-  // 保存历史记录到 localStorage
-  const saveToHistory = async (result: AnalyzeResponse, thumbnail: string, imageBase64?: string) => {
-    // 如果没有提供 base64，尝试从 thumbnail URL 获取
-    let savedImageBase64 = imageBase64
-    if (!savedImageBase64 && thumbnail.startsWith('blob:')) {
-      try {
-        // 从 blob URL 获取 base64
-        const response = await fetch(thumbnail)
-        const blob = await response.blob()
-        savedImageBase64 = await blobToBase64(blob)
-      } catch (e) {
-        console.warn('无法保存图片数据:', e)
-      }
-    } else if (!savedImageBase64 && thumbnail.startsWith('data:')) {
-      // 如果已经是 base64，直接使用
-      savedImageBase64 = thumbnail
+  const persistHistory = (items: ScanHistory[]) => {
+    const limited = items.slice(0, HISTORY_LIMIT).map((item) => ({
+      id: item.id,
+      date: item.date,
+      productName: item.productName,
+      grade: item.grade,
+      score: item.score,
+      thumbnail: item.thumbnail,
+      analysisData: item.analysisData,
+    }))
+
+    try {
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(limited))
+      setScanHistory(limited)
+    } catch (e: any) {
+      console.warn("历史记录存储空间不足，缩减保存数量", e)
+      const trimmed = limited.slice(0, Math.min(8, HISTORY_LIMIT)).map((item) => ({
+        ...item,
+        thumbnail: PLACEHOLDER_IMAGE,
+      }))
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(trimmed))
+      setScanHistory(trimmed)
     }
-    
+  }
+
+  const saveToHistory = (result: AnalyzeResponse, thumbnail: string) => {
     const newItem: ScanHistory = {
       id: Date.now().toString(),
       date: new Date(),
@@ -127,43 +154,11 @@ export default function IngrediScanAI() {
       grade: result.health_score,
       score: parseScoreFromSummary(result.summary),
       thumbnail,
-      imageBase64: savedImageBase64,
       analysisData: result,
     }
-    const updated = [newItem, ...scanHistory]
-    setScanHistory(updated)
-    
-    // 保存到 localStorage（注意：localStorage 有大小限制，通常 5-10MB）
-    try {
-      const jsonString = JSON.stringify(updated)
-      // 检查大小（大约估算）
-      const sizeInMB = new Blob([jsonString]).size / 1024 / 1024
-      if (sizeInMB > 8) {
-        // 如果超过 8MB，只保留最近 15 条记录
-        console.warn(`历史记录数据较大 (${sizeInMB.toFixed(2)}MB)，只保留最近 15 条`)
-        const limited = updated.slice(0, 15)
-        localStorage.setItem('scanHistory', JSON.stringify(limited))
-        setScanHistory(limited)
-      } else {
-        localStorage.setItem('scanHistory', jsonString)
-      }
-    } catch (e: any) {
-      console.error('保存历史记录失败:', e)
-      // 如果超出限制，尝试只保存最近 10 条（减少图片数据）
-      if (e.name === 'QuotaExceededError' || e.code === 22) {
-        console.warn('存储空间不足，只保留最近 10 条记录')
-        const limited = updated.slice(0, 10).map(item => ({
-          ...item,
-          // 移除 base64 数据以节省空间，只保留 thumbnail
-          imageBase64: undefined
-        }))
-        localStorage.setItem('scanHistory', JSON.stringify(limited))
-        setScanHistory(limited)
-      }
-    }
+    persistHistory([newItem, ...scanHistory])
   }
   
-  // 从历史记录加载并显示结果
   const loadHistoryItem = (item: ScanHistory) => {
     if (!item.analysisData) {
       setError('历史记录数据不完整，无法查看详情')
@@ -171,39 +166,12 @@ export default function IngrediScanAI() {
       return
     }
     
-    // 清除之前的错误和状态
     setError(null)
     setProgress(100)
     setIsDetailsOpen(false)
-    
-    // 设置分析结果
     setAnalysisResult(item.analysisData)
-    
-    // 设置图片预览（优先使用 base64，确保图片可以显示）
-    if (item.imageBase64) {
-      // 如果 base64 不包含 data: 前缀，添加它
-      const imageData = item.imageBase64.startsWith('data:') 
-        ? item.imageBase64 
-        : `data:image/jpeg;base64,${item.imageBase64}`
-      setCurrentImage(imageData)
-    } else if (item.thumbnail) {
-      // 如果是 blob URL，可能已失效，尝试使用 base64 或占位符
-      if (item.thumbnail.startsWith('blob:')) {
-        // blob URL 可能已失效，尝试从 localStorage 重新加载
-        setCurrentImage("/placeholder.svg")
-      } else if (item.thumbnail.startsWith('data:')) {
-        setCurrentImage(item.thumbnail)
-      } else {
-        setCurrentImage(item.thumbnail)
-      }
-    } else {
-      setCurrentImage("/placeholder.svg")
-    }
-    
-    // 切换到结果页面
+    setCurrentImage(item.thumbnail || PLACEHOLDER_IMAGE)
     setCurrentPage("results")
-    
-    // 滚动到顶部
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
@@ -236,6 +204,7 @@ export default function IngrediScanAI() {
         quality: 0.8,
         maxSizeMB: 1,
       })
+      const historyThumbnail = await createThumbnailDataUrl(compressedBlob)
 
       setProgress(40)
       setProcessingStage("uploading")
@@ -254,9 +223,9 @@ export default function IngrediScanAI() {
       setAnalysisResult(result)
       setProgress(100)
       
-      // 如果没有错误，保存到历史记录（包含图片 base64）
+      // 历史记录只保存小缩略图，避免浏览器本地存储被大图占满。
       if (!result.error) {
-        saveToHistory(result, previewUrl, base64)
+        saveToHistory(result, historyThumbnail)
       }
       
       setTimeout(() => {
@@ -266,14 +235,23 @@ export default function IngrediScanAI() {
       console.error('处理失败:', err)
       // 创建错误响应对象
       const errorMessage = err instanceof Error ? err.message : '处理失败，请重试'
+      const loweredErrorMessage = errorMessage.toLowerCase()
       let errorType: 'invalid_image' | 'api_error' | 'parse_error' | 'server_error' | 'unknown_error' = 'unknown_error'
       let userMessage = errorMessage
       
       // 根据错误信息判断错误类型
-      if (errorMessage.includes('网络') || errorMessage.includes('network') || errorMessage.includes('连接') || errorMessage.includes('fetch')) {
+      if (
+        errorMessage.includes('网络') ||
+        errorMessage.includes('连接') ||
+        loweredErrorMessage.includes('network') ||
+        loweredErrorMessage.includes('fetch') ||
+        loweredErrorMessage.includes('load failed') ||
+        loweredErrorMessage.includes('failed to fetch') ||
+        loweredErrorMessage.includes('cors')
+      ) {
         errorType = 'api_error'
-        userMessage = '网络连接失败，请检查网络后重试'
-      } else if (errorMessage.includes('超时') || errorMessage.includes('timeout')) {
+        userMessage = '网络连接失败（可能是跨域配置或后端地址问题），请稍后重试'
+      } else if (errorMessage.includes('超时') || loweredErrorMessage.includes('timeout')) {
         errorType = 'api_error'
         userMessage = '请求超时，请稍后重试'
       } else if (errorMessage.includes('图片') || errorMessage.includes('image')) {
@@ -337,8 +315,7 @@ export default function IngrediScanAI() {
 
   const deleteHistoryItem = (id: string) => {
     const updated = scanHistory.filter((item) => item.id !== id)
-    setScanHistory(updated)
-    localStorage.setItem('scanHistory', JSON.stringify(updated))
+    persistHistory(updated)
   }
 
   // 将分析结果转换为 Ingredient 格式
@@ -387,7 +364,7 @@ export default function IngrediScanAI() {
   const health = analysisResult ? getHealthScore(analysisResult) : { grade: "B", color: "text-yellow-600", bg: "bg-yellow-500", label: "Fair", score: 50 }
 
   const handleReset = () => {
-    if (currentImage) {
+    if (currentImage?.startsWith("blob:")) {
       revokeImagePreview(currentImage)
     }
     setCurrentImage(null)
@@ -550,7 +527,7 @@ export default function IngrediScanAI() {
         {currentPage === "results" && analysisResult && (
           <div className="min-h-screen flex flex-col px-6 py-8 space-y-6 safe-area-inset">
             {/* 显示历史记录标识（如果是从历史记录加载的） */}
-            {currentImage && !currentImage.startsWith('blob:') && currentImage !== "/placeholder.svg" && (
+            {currentImage && !currentImage.startsWith('blob:') && currentImage !== PLACEHOLDER_IMAGE && (
               <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground bg-muted/50 px-4 py-2 rounded-lg">
                 <Clock className="w-4 h-4" />
                 <span>查看历史记录</span>
@@ -854,7 +831,7 @@ export default function IngrediScanAI() {
                       {/* Thumbnail */}
                       <div className="w-20 h-20 rounded-lg overflow-hidden bg-muted flex-shrink-0">
                         <img
-                          src={item.imageBase64 || item.thumbnail || "/placeholder.svg"}
+                          src={item.thumbnail || PLACEHOLDER_IMAGE}
                           alt={item.productName}
                           className="w-full h-full object-cover"
                         />

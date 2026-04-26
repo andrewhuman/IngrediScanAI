@@ -51,6 +51,12 @@ python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - `OPENROUTER_MODEL`: 模型名（默认 `nvidia/nemotron-nano-12b-v2-vl:free`）
 - `OPENROUTER_SITE_URL`: 可选，OpenRouter 统计来源站点
 - `OPENROUTER_APP_NAME`: 可选，OpenRouter 展示应用名
+- `LANGSMITH_TRACING`: 可选，是否开启 LangSmith 追踪（`true/false`）
+- `LANGSMITH_API_KEY`: 可选，LangSmith API Key（开启追踪时必需）
+- `LANGSMITH_PROJECT`: 可选，LangSmith 项目标识
+- `SENTRY_DSN`: 可选，Sentry DSN（开启后端错误监控）
+- `SENTRY_ENVIRONMENT`: 可选，Sentry 环境名（如 `production`）
+- `SENTRY_TRACES_SAMPLE_RATE`: 可选，Sentry 采样率（如 `0.1`）
 - `CORS_ALLOWED_ORIGINS`: 允许跨域来源（逗号分隔）
 - `CORS_ALLOWED_ORIGIN_REGEX`: 允许跨域来源正则（可选）
 - `PORT`: 服务端口（默认 8000）
@@ -63,7 +69,15 @@ OPENROUTER_MODEL=nvidia/nemotron-nano-12b-v2-vl:free
 CORS_ALLOWED_ORIGINS=http://localhost:3000,https://your-frontend.vercel.app
 # 可选：需要放行 Vercel Preview 时再开启
 # CORS_ALLOWED_ORIGIN_REGEX=^https://.*\.vercel\.app$
+LANGSMITH_TRACING=false
+# LANGSMITH_API_KEY=your-langsmith-api-key
+LANGSMITH_PROJECT=ingrediscanai-dev
+# SENTRY_DSN=https://xxxx@o000000.ingest.sentry.io/000000
+SENTRY_ENVIRONMENT=development
+SENTRY_TRACES_SAMPLE_RATE=0.1
 ```
+
+注意：`CORS_ALLOWED_ORIGINS` 只写 Origin（协议+域名+可选端口），不要带路径和末尾 `/`。
 
 ## Render 部署
 
@@ -107,4 +121,13 @@ pip list | grep openai
 conda activate p312
 pip install -r requirements.txt
 ```
+
+### 问题：`OPTIONS /api/v1/analyze` 返回 400
+
+**原因**：CORS 预检被拦截，前端 Origin 不在 `CORS_ALLOWED_ORIGINS` 或 `CORS_ALLOWED_ORIGIN_REGEX` 中。
+
+**检查与解决**：
+1. 确认 Render 环境变量 `CORS_ALLOWED_ORIGINS` 包含前端真实域名（含 `https://`）。
+2. 查看后端日志中的 `CORS preflight blocked` 行，核对 `origin` 与当前白名单。
+3. 如需允许 Vercel Preview，再配置 `CORS_ALLOWED_ORIGIN_REGEX=^https://.*\\.vercel\\.app$`。
 # IngrediScanAI

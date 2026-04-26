@@ -3,24 +3,108 @@ IngrediScan AI Backend Service
 FastAPI 后端服务，集成 RapidOCR 和 OpenRouter 多模态模型
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import base64
 import io
 from PIL import Image
 import os
+import signal
+import uuid
 from typing import Optional
 import logging
 import threading
+from starlette.datastructures import Headers
+
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.logging import LoggingIntegration
+    SENTRY_AVAILABLE = True
+except ImportError:
+    SENTRY_AVAILABLE = False
 
 # 导入 OCR 和 VLM 模块
 from services.ocr_service import OCRService
 from services.vlm_service import VLMService
+from services.runtime_logging import elapsed_ms, memory_snapshot, now_ms, text_preview
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _install_signal_logging() -> None:
+    def log_signal(signum, _frame):
+        signal_name = signal.Signals(signum).name
+        logger.warning("process_signal_received signal=%s %s", signal_name, memory_snapshot())
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, log_signal)
+        except ValueError:
+            logger.debug("无法安装信号日志处理器: %s", sig)
+
+
+def _read_float_env(env_name: str, default: float) -> float:
+    raw_value = os.getenv(env_name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        logger.warning("环境变量 %s=%r 不是有效浮点数，使用默认值 %s", env_name, raw_value, default)
+        return default
+
+
+def init_sentry() -> None:
+    dsn = os.getenv("SENTRY_DSN", "").strip()
+    if not dsn:
+        logger.info("Sentry 未启用：SENTRY_DSN 未设置")
+        return
+    if not SENTRY_AVAILABLE:
+        logger.error("检测到 SENTRY_DSN，但 sentry-sdk 未安装")
+        return
+
+    sentry_sdk.init(
+        dsn=dsn,
+        environment=os.getenv("SENTRY_ENVIRONMENT", os.getenv("ENVIRONMENT", "production")),
+        traces_sample_rate=_read_float_env("SENTRY_TRACES_SAMPLE_RATE", 0.1),
+        profiles_sample_rate=_read_float_env("SENTRY_PROFILES_SAMPLE_RATE", 0.0),
+        integrations=[
+            FastApiIntegration(),
+            LoggingIntegration(level=logging.INFO, event_level=logging.ERROR),
+        ],
+        send_default_pii=False,
+    )
+    logger.info("Sentry 已启用")
+
+
+class LoggingCORSMiddleware(CORSMiddleware):
+    """在 CORS 预检失败时输出详细上下文，便于定位 Render 上的 400 OPTIONS。"""
+
+    def preflight_response(self, request_headers: Headers):
+        response = super().preflight_response(request_headers)
+        if response.status_code >= 400:
+            origin = request_headers.get("origin", "")
+            req_method = request_headers.get("access-control-request-method", "")
+            req_headers = request_headers.get("access-control-request-headers", "")
+            allow_regex = self.allow_origin_regex.pattern if self.allow_origin_regex else ""
+            logger.warning(
+                "CORS preflight blocked: origin=%s method=%s req_headers=%s allow_origins=%s allow_origin_regex=%s",
+                origin,
+                req_method,
+                req_headers,
+                list(self.allow_origins),
+                allow_regex,
+            )
+        return response
+
+
+init_sentry()
+_install_signal_logging()
 
 app = FastAPI(
     title="IngrediScan AI API",
@@ -33,7 +117,16 @@ def _load_cors_allowed_origins() -> list[str]:
         "CORS_ALLOWED_ORIGINS",
         "http://localhost:3000,http://127.0.0.1:3000",
     )
-    return [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    normalized: list[str] = []
+    for origin in raw_origins.split(","):
+        candidate = origin.strip()
+        if not candidate:
+            continue
+        # Origin 头本身不包含路径，去掉末尾 / 避免配置误差导致不匹配。
+        candidate = candidate.rstrip("/")
+        if candidate:
+            normalized.append(candidate)
+    return normalized
 
 
 cors_allowed_origins = _load_cors_allowed_origins()
@@ -53,15 +146,23 @@ cors_allowed_origin_regex = os.getenv(
 logger.info("CORS allowed origins: %s", cors_allowed_origins)
 if cors_allowed_origin_regex:
     logger.info("CORS allowed origin regex: %s", cors_allowed_origin_regex)
+if any("your-frontend" in origin for origin in cors_allowed_origins):
+    logger.warning("CORS_ALLOWED_ORIGINS 仍包含占位符，请替换为真实前端域名")
+if cors_allowed_origins and all(
+    origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1")
+    for origin in cors_allowed_origins
+):
+    logger.warning("CORS_ALLOWED_ORIGINS 当前仅包含本地域名，线上前端请求会被拦截")
 
 # CORS 配置（前端直连后端）
 app.add_middleware(
-    CORSMiddleware,
+    LoggingCORSMiddleware,
     allow_origins=cors_allowed_origins,
     allow_origin_regex=cors_allowed_origin_regex or None,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
 
 # 初始化服务
@@ -76,8 +177,14 @@ def get_ocr_service() -> OCRService:
     if _ocr_service is None:
         with _ocr_service_lock:
             if _ocr_service is None:
-                logger.info("初始化 OCR 引擎（lazy load）...")
+                start_ms = now_ms()
+                logger.info("ocr_lazy_init_start %s", memory_snapshot())
                 _ocr_service = OCRService()
+                logger.info(
+                    "ocr_lazy_init_done elapsed_ms=%s %s",
+                    elapsed_ms(start_ms),
+                    memory_snapshot(),
+                )
     return _ocr_service
 
 
@@ -109,7 +216,7 @@ class AnalyzeResponse(BaseModel):
     error_type: Optional[str] = None  # 错误类型：invalid_image, api_error, parse_error 等
 
 
-def decode_base64_image(image_base64: str) -> Image.Image:
+def decode_base64_image(image_base64: str, request_id: str = "-") -> Image.Image:
     """将 Base64 字符串解码为 PIL Image"""
     try:
         # 移除 data URL 前缀（如果存在）
@@ -118,9 +225,24 @@ def decode_base64_image(image_base64: str) -> Image.Image:
         
         image_data = base64.b64decode(image_base64)
         image = Image.open(io.BytesIO(image_data))
+        logger.info(
+            "analyze_image_decoded request_id=%s image_bytes=%s size=%s mode=%s format=%s %s",
+            request_id,
+            len(image_data),
+            image.size,
+            image.mode,
+            image.format,
+            memory_snapshot(),
+        )
         return image
     except Exception as e:
-        logger.error(f"图片解码失败: {e}")
+        logger.error(
+            "analyze_image_decode_failed request_id=%s error=%s payload_base64_len=%s %s",
+            request_id,
+            e,
+            len(image_base64 or ""),
+            memory_snapshot(),
+        )
         raise HTTPException(status_code=400, detail=f"无效的图片数据: {str(e)}")
 
 
@@ -135,7 +257,7 @@ async def health_check():
 
 
 @app.post("/api/v1/analyze", response_model=AnalyzeResponse)
-async def analyze_product(request: AnalyzeRequest):
+async def analyze_product(request: Request, response: Response, payload: AnalyzeRequest):
     """
     分析产品图片的主接口
     
@@ -145,34 +267,94 @@ async def analyze_product(request: AnalyzeRequest):
     3. VLM 分析成分和健康风险
     4. 返回结构化结果
     """
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    response.headers["X-Request-ID"] = request_id
+    total_start_ms = now_ms()
+    origin = request.headers.get("origin", "-")
+    user_agent = text_preview(request.headers.get("user-agent", "-"), 180)
+
     try:
-        logger.info("开始分析产品图片...")
+        logger.info(
+            "analyze_start request_id=%s origin=%s image_type=%s payload_base64_len=%s user_agent=%s %s",
+            request_id,
+            origin,
+            payload.image_type,
+            len(payload.image_base64 or ""),
+            user_agent,
+            memory_snapshot(),
+        )
         
         # Step 1: 解码图片
-        image = decode_base64_image(request.image_base64)
-        logger.info(f"图片解码成功，尺寸: {image.size}")
+        step_ms = now_ms()
+        image = decode_base64_image(payload.image_base64, request_id=request_id)
+        logger.info(
+            "analyze_decode_done request_id=%s elapsed_ms=%s size=%s %s",
+            request_id,
+            elapsed_ms(step_ms),
+            image.size,
+            memory_snapshot(),
+        )
         
         # Step 2: OCR 提取文字
-        logger.info("开始 OCR 文字提取...")
+        step_ms = now_ms()
+        logger.info("analyze_ocr_start request_id=%s %s", request_id, memory_snapshot())
         ocr_service = get_ocr_service()
-        ocr_text = await ocr_service.extract_text(image)
-        logger.info(f"OCR 提取完成，文字长度: {len(ocr_text)}")
+        ocr_text = await ocr_service.extract_text(image, request_id=request_id)
+        logger.info(
+            "analyze_ocr_done request_id=%s elapsed_ms=%s text_len=%s text_preview=%s %s",
+            request_id,
+            elapsed_ms(step_ms),
+            len(ocr_text),
+            text_preview(ocr_text),
+            memory_snapshot(),
+        )
         
         # Step 3: VLM 分析
-        logger.info("开始 VLM 分析...")
+        step_ms = now_ms()
+        logger.info("analyze_vlm_start request_id=%s %s", request_id, memory_snapshot())
         analysis_result = await vlm_service.analyze_ingredients(
             image=image,
-            ocr_text=ocr_text
+            ocr_text=ocr_text,
+            request_id=request_id,
         )
-        logger.info("VLM 分析完成")
+        logger.info(
+            "analyze_vlm_done request_id=%s elapsed_ms=%s error_type=%s has_error=%s %s",
+            request_id,
+            elapsed_ms(step_ms),
+            analysis_result.error_type,
+            bool(analysis_result.error),
+            memory_snapshot(),
+        )
         
         # Step 4: 返回结果
+        logger.info(
+            "analyze_done request_id=%s total_elapsed_ms=%s result_error_type=%s result_score=%s %s",
+            request_id,
+            elapsed_ms(total_start_ms),
+            analysis_result.error_type,
+            analysis_result.health_score,
+            memory_snapshot(),
+        )
         return analysis_result
         
     except HTTPException:
+        logger.warning(
+            "analyze_http_exception request_id=%s total_elapsed_ms=%s %s",
+            request_id,
+            elapsed_ms(total_start_ms),
+            memory_snapshot(),
+            exc_info=True,
+        )
         raise
     except Exception as e:
-        logger.error(f"分析过程出错: {e}", exc_info=True)
+        logger.error(
+            "analyze_unhandled_exception request_id=%s total_elapsed_ms=%s error=%s %s",
+            request_id,
+            elapsed_ms(total_start_ms),
+            e,
+            memory_snapshot(),
+            exc_info=True,
+        )
         
         # 根据错误类型返回不同的错误信息
         error_message = str(e)
@@ -190,7 +372,7 @@ async def analyze_product(request: AnalyzeRequest):
             user_message = f"服务器处理出错：{error_message}"
         
         # 返回错误信息而不是抛出异常，让前端可以显示错误
-        return AnalyzeResponse(
+        result = AnalyzeResponse(
             health_score="",
             summary="",
             risks=[],
@@ -199,6 +381,15 @@ async def analyze_product(request: AnalyzeRequest):
             error=user_message,
             error_type=error_type
         )
+        logger.info(
+            "analyze_done request_id=%s total_elapsed_ms=%s result_error_type=%s result_score=%s %s",
+            request_id,
+            elapsed_ms(total_start_ms),
+            result.error_type,
+            result.health_score,
+            memory_snapshot(),
+        )
+        return result
 
 
 if __name__ == "__main__":

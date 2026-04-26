@@ -217,6 +217,8 @@ CORS_ALLOWED_ORIGINS=https://your-frontend.vercel.app
 # CORS_ALLOWED_ORIGIN_REGEX=^https://.*\.vercel\.app$
 ```
 
+注意：`CORS_ALLOWED_ORIGINS` 里的域名不要带路径，建议不写末尾 `/`。
+
 后端健康检查：
 
 - `GET /health`
@@ -258,6 +260,12 @@ OPENROUTER_MODEL=nvidia/nemotron-nano-12b-v2-vl:free
 CORS_ALLOWED_ORIGINS=http://localhost:3000,https://your-frontend.vercel.app
 # 可选：需要放行 Vercel Preview 时再开启
 # CORS_ALLOWED_ORIGIN_REGEX=^https://.*\.vercel\.app$
+LANGSMITH_TRACING=false
+# LANGSMITH_API_KEY=your-langsmith-api-key
+LANGSMITH_PROJECT=ingrediscanai-dev
+# SENTRY_DSN=https://xxxx@o000000.ingest.sentry.io/000000
+SENTRY_ENVIRONMENT=development
+SENTRY_TRACES_SAMPLE_RATE=0.1
 PORT=8000
 ```
 
@@ -266,6 +274,20 @@ PORT=8000
 后端服务启动后，访问：
 - Swagger UI: http://localhost:8000/docs
 - ReDoc: http://localhost:8000/redoc
+
+## 监控与日志（推荐）
+
+### 必选：Sentry
+
+- 前端：设置 `NEXT_PUBLIC_SENTRY_DSN`（可选 `NEXT_PUBLIC_SENTRY_ENVIRONMENT`、`NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE`）
+- 后端：设置 `SENTRY_DSN`（可选 `SENTRY_ENVIRONMENT`、`SENTRY_TRACES_SAMPLE_RATE`）
+
+### 推荐：LangSmith（LLM 调用链路）
+
+- 后端设置：
+  - `LANGSMITH_TRACING=true`
+  - `LANGSMITH_API_KEY=...`
+  - `LANGSMITH_PROJECT=ingrediscanai-production`
 
 ## 注意事项
 
@@ -287,7 +309,8 @@ PORT=8000
 - **OCR 失败**：检查 RapidOCR 是否正确安装
 - **VLM API 错误**：检查 OpenRouter API Key 是否正确设置
 - **端口冲突**：修改 `PORT` 环境变量或 `main.py` 中的端口号
-
+- **CORS 预检 400**：检查 Render 的 `CORS_ALLOWED_ORIGINS` 是否包含前端真实域名（含协议），并查看后端日志中的 `CORS preflight blocked` 详情
+- 最新修改和检查见文档：new.txt,按照new.txt修复相关问题。
 ## 许可证
 
 MIT License
@@ -295,3 +318,13 @@ MIT License
 ## 贡献
 
 欢迎提交 Issue 和 Pull Request！
+
+
+1 启动前端
+conda activate p312
+npm run dev
+
+2 启动后端
+conda activate p312
+export OPENROUTER_API_KEY=""
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000

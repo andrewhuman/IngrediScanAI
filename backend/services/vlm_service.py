@@ -10,6 +10,7 @@ import httpx
 from PIL import Image
 from typing import Optional
 from pydantic import BaseModel
+from services.runtime_logging import elapsed_ms, memory_snapshot, now_ms, text_preview
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,12 @@ try:
 except ImportError:
     OPENROUTER_SDK_AVAILABLE = False
     logger.warning("OpenAI SDK 未安装，请运行: pip install openai")
+
+try:
+    from langsmith.wrappers import wrap_openai
+    LANGSMITH_AVAILABLE = True
+except ImportError:
+    LANGSMITH_AVAILABLE = False
 
 
 class RiskItem(BaseModel):
@@ -79,6 +86,7 @@ class VLMService:
                 try:
                     self.client = OpenAI(**client_kwargs)
                     logger.info("OpenRouter API Key 已配置，模型: %s", self.model_name)
+                    self._enable_langsmith_if_needed()
                 except Exception as e:
                     # 某些环境下 ALL_PROXY=socks://... 会导致 httpx 抛 Unknown scheme 错误
                     if "Unknown scheme for proxy URL" in str(e):
@@ -94,6 +102,7 @@ class VLMService:
                                 "OpenRouter 客户端已在禁用环境代理模式下初始化成功，模型: %s",
                                 self.model_name,
                             )
+                            self._enable_langsmith_if_needed()
                         except Exception as e2:
                             self.client = None
                             logger.error("OpenRouter 客户端初始化失败: %s", e2)
@@ -104,6 +113,28 @@ class VLMService:
                 logger.warning("未设置 OPENROUTER_API_KEY 环境变量")
         else:
             logger.warning("OpenRouter SDK 不可用")
+
+    def _enable_langsmith_if_needed(self) -> None:
+        tracing_flag = os.getenv("LANGSMITH_TRACING", "").strip().lower()
+        if tracing_flag not in {"1", "true", "yes", "on"}:
+            return
+        if not self.client:
+            return
+        if not LANGSMITH_AVAILABLE:
+            logger.warning("LANGSMITH_TRACING 已开启，但 langsmith 未安装")
+            return
+        if not os.getenv("LANGSMITH_API_KEY", "").strip():
+            logger.warning("LANGSMITH_TRACING 已开启，但 LANGSMITH_API_KEY 未设置")
+            return
+
+        try:
+            self.client = wrap_openai(self.client)
+            logger.info(
+                "LangSmith tracing 已启用，project=%s",
+                os.getenv("LANGSMITH_PROJECT", "default"),
+            )
+        except Exception as e:
+            logger.error("LangSmith 包装 OpenAI 客户端失败: %s", e)
     
     def _image_to_base64(self, image: Image.Image) -> str:
         """将 PIL Image 转换为 Base64 字符串"""
@@ -115,7 +146,7 @@ class VLMService:
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         return img_base64
     
-    def _parse_json_response(self, text: str) -> dict:
+    def _parse_json_response(self, text: str, request_id: str = "-") -> dict:
         """
         健壮的 JSON 解析器，具有高容错率
         
@@ -136,7 +167,9 @@ class VLMService:
         
         # 2. 尝试直接解析
         try:
-            return json.loads(text)
+            result = json.loads(text)
+            logger.info("vlm_json_parse_done request_id=%s method=direct %s", request_id, memory_snapshot())
+            return result
         except json.JSONDecodeError:
             pass
         
@@ -157,7 +190,9 @@ class VLMService:
         
         # 4.4 尝试解析修复后的 JSON
         try:
-            return json.loads(json_str)
+            result = json.loads(json_str)
+            logger.info("vlm_json_parse_done request_id=%s method=cleaned %s", request_id, memory_snapshot())
+            return result
         except json.JSONDecodeError:
             pass
         
@@ -175,9 +210,18 @@ class VLMService:
         json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
         
         try:
-            return json.loads(json_str)
+            result = json.loads(json_str)
+            logger.info("vlm_json_parse_done request_id=%s method=quote_fix %s", request_id, memory_snapshot())
+            return result
         except json.JSONDecodeError as e:
-            logger.warning(f"JSON 解析失败，尝试最后一种方法: {e}")
+            logger.warning(
+                "vlm_json_parse_retry request_id=%s error=%s raw_len=%s raw_preview=%s %s",
+                request_id,
+                e,
+                len(text or ""),
+                text_preview(text, 500),
+                memory_snapshot(),
+            )
             # 6. 最后尝试：使用 ast.literal_eval（仅当 JSON 格式接近 Python 字典时）
             try:
                 import ast
@@ -191,15 +235,23 @@ class VLMService:
                     try:
                         result = ast.literal_eval(text.replace('true', 'True').replace('false', 'False').replace('null', 'None'))
                         # 转换回标准 JSON 格式
-                        return json.loads(json.dumps(result))
+                        parsed = json.loads(json.dumps(result))
+                        logger.info("vlm_json_parse_done request_id=%s method=ast_literal_eval %s", request_id, memory_snapshot())
+                        return parsed
                     except:
                         pass
             except Exception as e2:
-                logger.error(f"所有 JSON 解析方法都失败: {e2}")
+                logger.error("vlm_json_parse_ast_failed request_id=%s error=%s %s", request_id, e2, memory_snapshot())
             
             # 如果所有方法都失败，记录错误并返回包含错误信息的字典
-            logger.error(f"JSON 解析失败，原始文本前500字符: {text[:500]}")
-            logger.error(f"JSON 解析错误详情: {e}")
+            logger.error(
+                "vlm_json_parse_failed request_id=%s error=%s raw_len=%s raw_preview=%s %s",
+                request_id,
+                e,
+                len(text or ""),
+                text_preview(text, 700),
+                memory_snapshot(),
+            )
             # 返回错误信息，而不是空字典
             return {
                 "error": "数据解析失败，可能是图片类型不正确或 API 返回格式异常，请重新上传清晰的商品标签图片",
@@ -333,7 +385,8 @@ class VLMService:
     async def analyze_ingredients(
         self,
         image: Image.Image,
-        ocr_text: str = ""
+        ocr_text: str = "",
+        request_id: str = "-"
     ) -> AnalyzeResponse:
         """
         分析产品成分
@@ -346,7 +399,7 @@ class VLMService:
             AnalyzeResponse 对象
         """
         if not OPENROUTER_SDK_AVAILABLE or not self.api_key or not self.client:
-            logger.error("OpenRouter API 不可用：缺少可用客户端或 API Key")
+            logger.error("vlm_unavailable request_id=%s reason=missing_client_or_key %s", request_id, memory_snapshot())
             return AnalyzeResponse(
                 health_score="",
                 summary="",
@@ -358,14 +411,33 @@ class VLMService:
             )
         
         try:
+            total_start_ms = now_ms()
             # 转换图片为 Base64
+            step_ms = now_ms()
             img_base64 = self._image_to_base64(image)
-            logger.info(f"ocr_text: {ocr_text}")
+            logger.info(
+                "vlm_image_encoded request_id=%s elapsed_ms=%s image_base64_len=%s image_size=%s ocr_text_len=%s ocr_preview=%s %s",
+                request_id,
+                elapsed_ms(step_ms),
+                len(img_base64),
+                image.size,
+                len(ocr_text or ""),
+                text_preview(ocr_text),
+                memory_snapshot(),
+            )
             # 构建提示词
             prompt = self._build_prompt(ocr_text)
+            logger.info(
+                "vlm_prompt_ready request_id=%s prompt_len=%s model=%s base_url=%s %s",
+                request_id,
+                len(prompt),
+                self.model_name,
+                self.base_url,
+                memory_snapshot(),
+            )
             
             # 调用 OpenRouter API（OpenAI-compatible Chat Completions）
-            logger.info("调用 OpenRouter VLM API...")
+            logger.info("vlm_openrouter_start request_id=%s model=%s %s", request_id, self.model_name, memory_snapshot())
             messages = [
                 {
                     "role": "user",
@@ -384,10 +456,21 @@ class VLMService:
                 }
             ]
             
+            api_start_ms = now_ms()
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
                 max_tokens=2000
+            )
+            logger.info(
+                "vlm_openrouter_done request_id=%s elapsed_ms=%s response_id=%s response_model=%s finish_reason=%s usage=%s %s",
+                request_id,
+                elapsed_ms(api_start_ms),
+                getattr(response, "id", None),
+                getattr(response, "model", None),
+                getattr(response.choices[0], "finish_reason", None) if response.choices else None,
+                getattr(response, "usage", None),
+                memory_snapshot(),
             )
 
             if not response.choices:
@@ -398,17 +481,37 @@ class VLMService:
             result_text = self._extract_response_text(content)
             
             if not result_text:
-                logger.error(f"无法从响应中提取文本，响应内容: {content}")
+                logger.error(
+                    "vlm_empty_response_text request_id=%s content_type=%s content_preview=%s %s",
+                    request_id,
+                    type(content).__name__,
+                    text_preview(str(content), 500),
+                    memory_snapshot(),
+                )
                 raise Exception("API 响应格式异常，无法提取文本内容")
             
-            logger.info(f"API 返回文本长度: {result_text}")
+            logger.info(
+                "vlm_response_text_ready request_id=%s text_len=%s text_preview=%s %s",
+                request_id,
+                len(result_text),
+                text_preview(result_text, 700),
+                memory_snapshot(),
+            )
             
             # 提取并解析 JSON（使用健壮的解析器）
-            result_data = self._parse_json_response(result_text)
+            parse_start_ms = now_ms()
+            result_data = self._parse_json_response(result_text, request_id=request_id)
+            logger.info(
+                "vlm_parse_done request_id=%s elapsed_ms=%s keys=%s %s",
+                request_id,
+                elapsed_ms(parse_start_ms),
+                list(result_data.keys()) if isinstance(result_data, dict) else type(result_data).__name__,
+                memory_snapshot(),
+            )
             
             # 检查解析结果是否为空（解析失败）
             if not result_data:
-                logger.error("JSON 解析失败，无法提取数据")
+                logger.error("vlm_parse_empty request_id=%s %s", request_id, memory_snapshot())
                 return AnalyzeResponse(
                     health_score="",
                     summary="",
@@ -423,7 +526,14 @@ class VLMService:
             if result_data.get("error"):
                 error_msg = result_data.get("error", "分析失败")
                 error_type = result_data.get("error_type", "unknown_error")
-                logger.info(f"检测到错误: {error_type} - {error_msg}")
+                logger.info(
+                    "vlm_model_error request_id=%s error_type=%s error=%s total_elapsed_ms=%s %s",
+                    request_id,
+                    error_type,
+                    text_preview(error_msg),
+                    elapsed_ms(total_start_ms),
+                    memory_snapshot(),
+                )
                 return AnalyzeResponse(
                     health_score="",
                     summary="",
@@ -436,7 +546,7 @@ class VLMService:
             
             # 如果解析结果为空字典，说明解析失败
             if result_data == {}:
-                logger.error("JSON 解析返回空字典")
+                logger.error("vlm_parse_empty_dict request_id=%s %s", request_id, memory_snapshot())
                 return AnalyzeResponse(
                     health_score="",
                     summary="",
@@ -468,7 +578,7 @@ class VLMService:
                     full_ingredients.append(name)
             
             # 转换为响应模型
-            return AnalyzeResponse(
+            response_data = AnalyzeResponse(
                 health_score=result_data.get("health_score", "C"),
                 summary=result_data.get("summary", "Unknown"),
                 risks=[
@@ -485,9 +595,26 @@ class VLMService:
                 error=None,
                 error_type=None
             )
+            logger.info(
+                "vlm_done request_id=%s total_elapsed_ms=%s score=%s risks=%s ingredients=%s alternatives=%s %s",
+                request_id,
+                elapsed_ms(total_start_ms),
+                response_data.health_score,
+                len(response_data.risks),
+                len(response_data.full_ingredients),
+                len(response_data.alternatives),
+                memory_snapshot(),
+            )
+            return response_data
             
         except Exception as e:
-            logger.error(f"VLM 分析失败: {e}", exc_info=True)
+            logger.error(
+                "vlm_failed request_id=%s error=%s %s",
+                request_id,
+                e,
+                memory_snapshot(),
+                exc_info=True,
+            )
             # 失败时返回错误信息，而不是模拟数据
             error_message = str(e)
             lowered = error_message.lower()

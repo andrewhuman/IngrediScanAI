@@ -13,11 +13,17 @@ echo "Python 版本: $(python --version)"
 echo "检查依赖..."
 python -c "import rapidocr_onnxruntime; print('✓ RapidOCR 已安装')" || echo "✗ RapidOCR 未安装"
 python -c "import openai; print('✓ OpenAI SDK 已安装（用于 OpenRouter）')" || echo "✗ OpenAI SDK 未安装"
+python -c "import sentry_sdk; print('✓ Sentry SDK 已安装')" || echo "✗ Sentry SDK 未安装（可选）"
+python -c "import langsmith; print('✓ LangSmith SDK 已安装')" || echo "✗ LangSmith SDK 未安装（可选）"
 
 # 设置 API Key（如果未设置）
 if [ -z "$OPENROUTER_API_KEY" ]; then
     echo "警告: OPENROUTER_API_KEY 未设置，请设置环境变量"
     echo "例如: export OPENROUTER_API_KEY='your-api-key-here'"
+fi
+
+if [ "$LANGSMITH_TRACING" = "true" ] && [ -z "$LANGSMITH_API_KEY" ]; then
+    echo "警告: LANGSMITH_TRACING=true 但 LANGSMITH_API_KEY 未设置"
 fi
 
 # 进入后端目录

@@ -14,6 +14,8 @@
   - FastAPI 0.115.0
   - RapidOCR 1.4.4 (支持 Python 3.12)
   - OpenAI 2.8.1（用于 OpenRouter）
+  - LangSmith（可选，LLM 调用链路追踪）
+  - Sentry SDK（可选，错误监控）
   - Uvicorn 0.32.0
 
 ## 🚀 启动项目
@@ -125,6 +127,8 @@ pillow==11.0.0
 numpy==2.1.0
 rapidocr-onnxruntime>=1.3.19  # 支持 Python 3.12
 openai==2.8.1
+langsmith>=0.1.0
+sentry-sdk[fastapi]>=2.0.0
 pydantic==2.9.0
 ```
 
