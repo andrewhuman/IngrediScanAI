@@ -10,7 +10,6 @@ import base64
 import io
 from PIL import Image
 import os
-import signal
 import uuid
 from typing import Optional
 import logging
@@ -33,19 +32,6 @@ from services.runtime_logging import elapsed_ms, memory_snapshot, now_ms, text_p
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def _install_signal_logging() -> None:
-    def log_signal(signum, _frame):
-        signal_name = signal.Signals(signum).name
-        logger.warning("process_signal_received signal=%s %s", signal_name, memory_snapshot())
-        raise SystemExit(0)
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            signal.signal(sig, log_signal)
-        except ValueError:
-            logger.debug("无法安装信号日志处理器: %s", sig)
 
 
 def _read_float_env(env_name: str, default: float) -> float:
@@ -104,7 +90,6 @@ class LoggingCORSMiddleware(CORSMiddleware):
 
 
 init_sentry()
-_install_signal_logging()
 
 app = FastAPI(
     title="IngrediScan AI API",
@@ -295,17 +280,13 @@ async def analyze_product(request: Request, response: Response, payload: Analyze
             memory_snapshot(),
         )
         
-        # Step 2: OCR 提取文字
+        # Step 2: 跳过 OCR，Render 免费实例上 RapidOCR 耗时和内存压力过高。
         step_ms = now_ms()
-        logger.info("analyze_ocr_start request_id=%s %s", request_id, memory_snapshot())
-        ocr_service = get_ocr_service()
-        ocr_text = await ocr_service.extract_text(image, request_id=request_id)
+        ocr_text = ""
         logger.info(
-            "analyze_ocr_done request_id=%s elapsed_ms=%s text_len=%s text_preview=%s %s",
+            "analyze_ocr_skipped request_id=%s elapsed_ms=%s reason=disabled_for_render_free_tier %s",
             request_id,
             elapsed_ms(step_ms),
-            len(ocr_text),
-            text_preview(ocr_text),
             memory_snapshot(),
         )
         

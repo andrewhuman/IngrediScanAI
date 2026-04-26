@@ -200,9 +200,9 @@ export default function IngrediScanAI() {
       // 压缩图片
       setProgress(20)
       const compressedBlob = await compressImage(file, {
-        maxWidthOrHeight: 1024,
-        quality: 0.8,
-        maxSizeMB: 1,
+        maxWidthOrHeight: 512,
+        quality: 0.65,
+        maxSizeMB: 0.45,
       })
       const historyThumbnail = await createThumbnailDataUrl(compressedBlob)
 
